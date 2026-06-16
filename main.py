@@ -33,14 +33,10 @@ def init_db():
 
 init_db()
 
-# 🍌 1. KELA COMMAND & BOT REACTION HANDLER
-async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 🍌 KELA CORE LOGIC (Jo dono command aur emoji ke liye database update karega)
+async def process_kela(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or update.effective_chat.type not in ["group", "supergroup"]:
-        return
-
-    text_content = msg.text.strip() if msg.text else ""
-    if text_content != "🍌" and text_content.lower() != "/kela":
         return
 
     if not msg.reply_to_message:
@@ -63,7 +59,7 @@ async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception: pass
         return
 
-    # Bot reaction lagayega
+    # Bot message par reaction lagayega
     try:
         await context.bot.set_message_reaction(
             chat_id=chat_id,
@@ -78,7 +74,7 @@ async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TY
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO active_groups (group_id) VALUES (?)", (chat_id,))
     
-    # Giver stats
+    # Giver stats update
     cursor.execute('''
         INSERT INTO users (group_id, user_id, username, first_name, daily_given, lifetime_given)
         VALUES (?, ?, ?, ?, 1, 1)
@@ -87,7 +83,7 @@ async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TY
         username = excluded.username, first_name = excluded.first_name
     ''', (chat_id, giver.id, giver.username, giver.first_name))
 
-    # Receiver stats
+    # Receiver stats update
     cursor.execute('''
         INSERT INTO users (group_id, user_id, username, first_name, received_bananas)
         VALUES (?, ?, ?, ?, 0, 0, 1)
@@ -99,7 +95,7 @@ async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TY
     conn.commit()
     conn.close()
 
-    # Flash confirmation message
+    # Flash Message confirmation
     username_str = f" (@{giver.username})" if giver.username else ""
     confirm_msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -113,7 +109,17 @@ async def kela_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TY
     try: await confirm_msg.delete()
     except Exception: pass
 
-# 🥷 2. /steal COMMAND HANDLER
+# TEXT HANDLER (Sirf jab koi exact '🍌' emoji bhejega tab chalega)
+async def kela_emoji_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg and msg.text and msg.text.strip() == "🍌":
+        await process_kela(update, context)
+
+# COMMAND HANDLER (Jab koi /kela command likhega)
+async def kela_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_kela(update, context)
+
+# 🥷 /steal HANDLER
 async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat_id = update.effective_chat.id
@@ -158,7 +164,7 @@ async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-# 🎲 3. /gamble COMMAND HANDLER
+# 🎲 /gamble HANDLER
 async def gamble_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -184,7 +190,7 @@ async def gamble_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-# 👤 4. /mybananas COMMAND HANDLER
+# 👤 /mybananas HANDLER
 async def my_bananas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -215,7 +221,7 @@ async def my_bananas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.delete()
     except Exception: pass
 
-# 📊 5. /leaderboard COMMAND HANDLER
+# 📊 /leaderboard HANDLER
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -236,7 +242,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     await update.message.reply_text(text)
 
-# 📥 6. /topreceivers COMMAND HANDLER
+# 📥 /topreceivers HANDLER
 async def top_receivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -257,7 +263,7 @@ async def top_receivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     await update.message.reply_text(text)
 
-# ⏰ DAILY RESET LOOP (Raat ke 12 Baje)
+# ⏰ AUTO RESET NIGHT LOOP
 async def custom_reset_loop(context: ContextTypes.DEFAULT_TYPE):
     while True:
         try:
@@ -291,18 +297,18 @@ def main():
     
     app = Application.builder().token(TOKEN).post_init(post_init).get_updates_connection_pool_size(16).build()
     
-    # 💥 SARE HANDLERS REGISTER HO GAYE HAIN (FIXED)
+    # ⭐ ORDER THEEK KAR DIYA: Taaki commands pehle execute ho aur block na ho
+    app.add_handler(CommandHandler("kela", kela_command_handler))
     app.add_handler(CommandHandler("steal", steal_banana))
     app.add_handler(CommandHandler("gamble", gamble_banana))
     app.add_handler(CommandHandler("mybananas", my_bananas))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("topreceivers", top_receivers))
     
-    # Kela Handler Commands & Emojis ke liye
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kela_shortcut_handler))
-    app.add_handler(CommandHandler("kela", kela_shortcut_handler))
+    # Filter text ko sabse aakhiri me rakha h jo sirf single '🍌' check karega
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kela_emoji_handler))
     
-    print("Kela Bot 3.0 perfectly running with ALL commands enabled...")
+    print("Kela Bot 3.1 (Order Fixed) perfectly running...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':

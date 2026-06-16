@@ -5,10 +5,10 @@ import datetime
 import random
 import pytz
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageReactionHandler
 
 # ========================================================
-# 🔴 AAPKA BOT TOKEN YAHA DALEIN
+# 🔴 AAPKA BOT TOKEN YAHA DALEIN (QUOTES KE ANDAR)
 # ========================================================
 TOKEN = "8906765022:AAHW8rhmVddEilwT-RmXX82n_CKCbOlqt3Q"
 # ========================================================
@@ -18,6 +18,7 @@ DB_NAME = os.getenv("DATABASE_PATH", "multi_group_banana.db")
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    # Updated table with received_bananas column
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             group_id INTEGER, user_id INTEGER, username TEXT, first_name TEXT,
@@ -26,83 +27,103 @@ def init_db():
             PRIMARY KEY (group_id, user_id)
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tracked_reactions (
+            group_id INTEGER, message_id INTEGER, user_id INTEGER, 
+            PRIMARY KEY (group_id, message_id, user_id)
+        )
+    ''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS active_groups (group_id INTEGER PRIMARY KEY)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS last_reset (date TEXT PRIMARY KEY)''')
+    
+    # Database migration: agar purani table hai toh received_bananas column add karein
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN received_bananas INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass # Column pehle se hai
+        
+    conn.execute("PRAGMA journal_mode=WAL;") 
     conn.commit()
     conn.close()
 
 init_db()
 
-# 🍌 1. /kela COMMAND HANDLER (NO REACTION - PURE COMMAND)
-async def kela_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg or update.effective_chat.type not in ["group", "supergroup"]:
+# 🍌 REACTION HANDLER: Jab koi 🍌 emoji lagaye
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction_update = update.message_reaction
+    if not reaction_update or reaction_update.chat.type not in ["group", "supergroup"]:
         return
 
-    # Check karke ki message kisi ke reply me hai ya nahi
-    if not msg.reply_to_message:
-        await msg.reply_text("❌ Kisi ke message par Reply karke `/kela` likho!")
-        return
+    chat_id = reaction_update.chat.id
+    message_id = reaction_update.message_id
+    user = reaction_update.user
 
-    chat_id = update.effective_chat.id
-    giver = update.effective_user
-    receiver = msg.reply_to_message.from_user
+    if not user: return # Anonymous reaction protection
 
-    if receiver.is_bot:
-        return 
+    # Check naye added reactions
+    new_reactions = reaction_update.new_reaction
+    has_banana = any(r.emoji == "🍌" for r in new_reactions if r.type == "emoji")
 
-    if giver.id == receiver.id:
-        warning = await msg.reply_text("❌ Khud ko kela nahi de sakte bhai! 😂")
-        await asyncio.sleep(3)
-        try:
-            await msg.delete()
-            await warning.delete()
-        except Exception: pass
-        return
+    if not has_banana: return
 
-    # Database updates
+    # Pehle message fetch karo taaki pata chale kiska message tha
+    try:
+        target_msg = await context.bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
+        receiver = target_msg.forward_from or target_msg.forward_sender_name
+        receiver_id = target_msg.forward_from.id if target_msg.forward_from else None
+        receiver_name = target_msg.forward_from.first_name if target_msg.forward_from else "User"
+        await context.bot.delete_message(chat_id=chat_id, message_id=target_msg.message_id)
+    except Exception:
+        return # Agar bot purana message read nahi kar pa raha
+
+    if not receiver_id or user.id == receiver_id:
+        return # Apne aap ko kela nahi de sakte
+
+    # Database me check karo ki is bande ne is message par pehle kela toh nahi diya
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM tracked_reactions WHERE group_id = ? AND message_id = ? AND user_id = ?", (chat_id, message_id, user.id))
+    
+    if cursor.fetchone():
+        conn.close()
+        return # Already given
+
+    # Record reaction and update stats
+    cursor.execute("INSERT INTO tracked_reactions (group_id, message_id, user_id) VALUES (?, ?, ?)", (chat_id, message_id, user.id))
     cursor.execute("INSERT OR IGNORE INTO active_groups (group_id) VALUES (?)", (chat_id,))
     
-    # Giver stats update
+    # Giver ki stats badhao
     cursor.execute('''
         INSERT INTO users (group_id, user_id, username, first_name, daily_given, lifetime_given)
         VALUES (?, ?, ?, ?, 1, 1)
         ON CONFLICT(group_id, user_id) DO UPDATE SET
         daily_given = daily_given + 1, lifetime_given = lifetime_given + 1,
         username = excluded.username, first_name = excluded.first_name
-    ''', (chat_id, giver.id, giver.username, giver.first_name))
+    ''', (chat_id, user.id, user.username, user.first_name))
 
-    # Receiver stats update
+    # Receiver ki stats badhao
     cursor.execute('''
         INSERT INTO users (group_id, user_id, username, first_name, received_bananas)
         VALUES (?, ?, ?, ?, 0, 0, 1)
         ON CONFLICT(group_id, user_id) DO UPDATE SET
         received_bananas = received_bananas + 1,
         username = excluded.username, first_name = excluded.first_name
-    ''', (chat_id, receiver.id, receiver.username, receiver.first_name))
+    ''', (chat_id, receiver_id, getattr(target_msg.forward_from, 'username', ''), receiver_name))
 
     conn.commit()
     conn.close()
 
-    # Flash Message confirmation (Chat me dikhega kisne kisko diya)
-    username_str = f" (@{giver.username})" if giver.username else ""
+    # Chat me confirmation message
+    username_str = f" (@{user.username})" if user.username else ""
     confirm_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"🍌 {giver.first_name}{username_str} ne {receiver.first_name} ko ek kela diya!"
+        text=f"🍌 {user.first_name}{username_str} ne {receiver_name} ke message par 🍌 ka reaction diya! (Lifetime Mila: +1)"
     )
-
-    # Command aur confirmation message delete karna taaki chat clean rahe
-    try: await msg.delete()
-    except Exception: pass
-    
     await asyncio.sleep(3)
     try: await confirm_msg.delete()
     except Exception: pass
 
-
-# 🥷 2. /steal COMMAND HANDLER
+# 🎰 /steal command handler
 async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat_id = update.effective_chat.id
@@ -121,6 +142,7 @@ async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
+    # Check target ke paas kela hai bhi ya nahi
     cursor.execute("SELECT lifetime_given FROM users WHERE group_id = ? AND user_id = ?", (chat_id, target.id))
     t_row = cursor.fetchone()
     if not t_row or t_row[0] < 1:
@@ -128,18 +150,22 @@ async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
+    # Check stealer ke paas backup kela hai fine dene ke liye
     cursor.execute("SELECT lifetime_given FROM users WHERE group_id = ? AND user_id = ?", (chat_id, user.id))
     s_row = cursor.fetchone()
     if not s_row or s_row[0] < 1:
-        await msg.reply_text("❌ Chori karne ke liye aapke paas khud ka kam se kam 1 Lifetime Kela hona chahiye fine backup ke liye!")
+        await msg.reply_text("❌ Chori karne ke liye aapke paas khud ka kam se kam 1 Lifetime Kela hona chahiye backup fine ke liye!")
         conn.close()
         return
 
+    # 50% Chance
     if random.choice([True, False]):
+        # Success: Target ka 1 kela chura liya
         cursor.execute("UPDATE users SET lifetime_given = lifetime_given - 1 WHERE group_id = ? AND user_id = ?", (chat_id, target.id))
         cursor.execute("UPDATE users SET lifetime_given = lifetime_given + 1 WHERE group_id = ? AND user_id = ?", (chat_id, user.id))
         await msg.reply_text(f"🥷 **CHORI SUCCESSFUL!**\n\n{user.first_name} ne chupke se {target.first_name} ka 1 Lifetime 🍌 chura liya! 😂")
     else:
+        # Fail: Fine lagega
         cursor.execute("UPDATE users SET lifetime_given = lifetime_given - 1 WHERE group_id = ? AND user_id = ?", (chat_id, user.id))
         cursor.execute("UPDATE users SET lifetime_given = lifetime_given + 1 WHERE group_id = ? AND user_id = ?", (chat_id, target.id))
         await msg.reply_text(f"👮‍♂️ **CHORI PAKDI GAYI!**\n\n{user.first_name} chori karte hue pakda gaya! Fine ke taur par iska 1 🍌 {target.first_name} ko de diya gaya! 🏴‍☠️")
@@ -147,8 +173,7 @@ async def steal_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-
-# 🎲 3. /gamble COMMAND HANDLER
+# 🎲 /gamble command handler
 async def gamble_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -164,6 +189,7 @@ async def gamble_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
+    # 45% win chance, 55% lose chance
     if random.random() < 0.45:
         cursor.execute("UPDATE users SET lifetime_given = lifetime_given + 2 WHERE group_id = ? AND user_id = ?", (chat_id, user.id))
         await update.message.reply_text(f"🎰 **JACKPOT!!** {user.first_name} ne gambling ki aur **+2 Lifetime Kelay** jeet liye! 🎉")
@@ -174,8 +200,7 @@ async def gamble_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-
-# 👤 4. /mybananas COMMAND HANDLER
+# 👤 /mybananas command handler
 async def my_bananas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -189,6 +214,7 @@ async def my_bananas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     dg, lg, rb = row if row else (0, 0, 0)
     
+    # Dynamic Title Assignment (Idea 4)
     if lg >= 100: title = "Kela King 👑"
     elif lg >= 50: title = "Kela Trader 🤝"
     elif lg >= 10: title = "Kela Lover 🐒"
@@ -206,8 +232,7 @@ async def my_bananas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.delete()
     except Exception: pass
 
-
-# 📊 5. /leaderboard COMMAND HANDLER
+# 📊 /leaderboard command handler (Top Givers)
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -228,8 +253,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     await update.message.reply_text(text)
 
-
-# 📥 6. /topreceivers COMMAND HANDLER
+# 📥 /topreceivers command handler (Idea 2)
 async def top_receivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ["group", "supergroup"]: return
     chat_id = update.effective_chat.id
@@ -250,8 +274,7 @@ async def top_receivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     await update.message.reply_text(text)
 
-
-# ⏰ AUTO RESET NIGHT LOOP (Raat ke 12 Baje)
+# Raat ke 12 baje reset loop
 async def custom_reset_loop(context: ContextTypes.DEFAULT_TYPE):
     while True:
         try:
@@ -272,32 +295,31 @@ async def custom_reset_loop(context: ContextTypes.DEFAULT_TYPE):
                         try: await context.bot.send_message(chat_id=g_id, text=award_text)
                         except Exception: pass
                     cursor.execute("UPDATE users SET daily_given = 0")
+                    cursor.execute("DELETE FROM tracked_reactions")
                     conn.commit()
                 conn.close()
         except Exception: pass
         await asyncio.sleep(30)
 
-
 async def post_init(application: Application):
     asyncio.create_task(custom_reset_loop(ContextTypes.DEFAULT_TYPE(application)))
-
 
 def main():
     if TOKEN == "Aapka_Telegram_Bot_Token_Yaha_Dalein": return
     
     app = Application.builder().token(TOKEN).post_init(post_init).get_updates_connection_pool_size(16).build()
     
-    # 💥 REGISTERING ALL COMMANDS CLEANLY
-    app.add_handler(CommandHandler("kela", kela_command_handler))
+    # Handlers
+    app.add_handler(MessageReactionHandler(handle_reaction))
     app.add_handler(CommandHandler("steal", steal_banana))
     app.add_handler(CommandHandler("gamble", gamble_banana))
     app.add_handler(CommandHandler("mybananas", my_bananas))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("topreceivers", top_receivers))
     
-    print("Kela Bot 4.0 (No Reactions - 100% Pure Commands) successfully running...")
+    print("Multi-Group Kela Bot 2.0 successfully shuru ho gaya hai...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
-        
+    
